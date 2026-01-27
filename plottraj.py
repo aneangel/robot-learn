@@ -1,84 +1,127 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.signal import savgol_filter
 
-# Path to demo trajectories folder
 demo_folder = 'demotrajectories'
+output_folder = 'velocity_plots'
+os.makedirs(output_folder, exist_ok=True)
 
-# Get all trajectory files
-trajectory_files = [f for f in os.listdir(demo_folder) if f.endswith('.npy') or f.endswith('.txt') or f.endswith('.csv')]
+trajectory_files = sorted([f for f in os.listdir(demo_folder) if f.endswith('.csv')])
 
-# Create figure with four subplots
-fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+# Smoothing parameters
+WINDOW_LENGTH = 31  # Must be odd, larger = more smoothing
+POLY_ORDER = 3      # Polynomial order for fitting
 
-# Plot each trajectory
-for i, filename in enumerate(trajectory_files):
+# Store all velocity data for combined plot
+all_velocities = []
+
+for filename in trajectory_files:
     filepath = os.path.join(demo_folder, filename)
+    demo_name = filename.replace('.csv', '')
     
-    # Load trajectory data
-    if filename.endswith('.npy'):
-        data = np.load(filepath)
-        # Assuming npy files have x, y, z columns
-        time = np.arange(len(data))
-        x_data = data[:, 0]
-        y_data = data[:, 1]
-        z_data = data[:, 2]
-        # Assuming columns 3-6 are qx, qy, qz, qw
-        qx_data = data[:, 3] if data.shape[1] > 3 else None
-        qy_data = data[:, 4] if data.shape[1] > 4 else None
-        qz_data = data[:, 5] if data.shape[1] > 5 else None
-        qw_data = data[:, 6] if data.shape[1] > 6 else None
-    elif filename.endswith('.txt') or filename.endswith('.csv'):
-        # Load x, y, z coordinates and quaternions (columns 1-7)
-        full_data = np.loadtxt(filepath, delimiter=',', skiprows=1, usecols=(1, 2, 3, 4, 5, 6, 7))
-        time = np.arange(len(full_data))
-        x_data = full_data[:, 0]
-        y_data = full_data[:, 1]
-        z_data = full_data[:, 2]
-        qx_data = full_data[:, 3]
-        qy_data = full_data[:, 4]
-        qz_data = full_data[:, 5]
-        qw_data = full_data[:, 6]
+    # Load timestamps and positions
+    timestamps = np.loadtxt(filepath, delimiter=',', skiprows=1, usecols=(0,), dtype=str)
+    positions = np.loadtxt(filepath, delimiter=',', skiprows=1, usecols=(1, 2, 3))
     
-    # Plot x vs time
-    ax1.plot(time, x_data, label=filename, alpha=0.7)
+    # Parse timestamps to get time in seconds
+    times = []
+    for ts in timestamps:
+        dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S.%f')
+        times.append(dt.timestamp())
+    times = np.array(times)
+    times = times - times[0]
     
-    # Plot y vs time
-    ax2.plot(time, y_data, label=filename, alpha=0.7)
+    # Calculate velocities (derivative of position)
+    dt = np.diff(times)
+    dt[dt < 0.001] = 0.001  # Avoid division by zero
     
-    # Plot z vs time
-    ax3.plot(time, z_data, label=filename, alpha=0.7)
+    vx = np.diff(positions[:, 0]) / dt
+    vy = np.diff(positions[:, 1]) / dt
+    vz = np.diff(positions[:, 2]) / dt
     
-    # Plot quaternion components vs time
-    if qx_data is not None:
-        ax4.plot(time, qx_data, label=f'{filename} (qx)', alpha=0.5, linestyle='-')
-        ax4.plot(time, qy_data, label=f'{filename} (qy)', alpha=0.5, linestyle='--')
-        ax4.plot(time, qz_data, label=f'{filename} (qz)', alpha=0.5, linestyle='-.')
-        ax4.plot(time, qw_data, label=f'{filename} (qw)', alpha=0.5, linestyle=':')
+    # Smooth velocities using Savitzky-Golay filter
+    win = min(WINDOW_LENGTH, len(vx) - 1)
+    if win % 2 == 0:
+        win -= 1  # Must be odd
+    if win >= 5:
+        vx_smooth = savgol_filter(vx, win, POLY_ORDER)
+        vy_smooth = savgol_filter(vy, win, POLY_ORDER)
+        vz_smooth = savgol_filter(vz, win, POLY_ORDER)
+    else:
+        vx_smooth, vy_smooth, vz_smooth = vx, vy, vz
+    
+    # Time for velocity
+    t_vel = times[:-1]
+    
+    # Store for combined plot
+    all_velocities.append({
+        'name': demo_name,
+        't': t_vel,
+        'vx': vx_smooth,
+        'vy': vy_smooth,
+        'vz': vz_smooth
+    })
+    
+    # Create figure for this demo
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    
+    ax1.plot(t_vel, vx_smooth, 'r-', linewidth=1.5)
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Velocity (m/s)')
+    ax1.set_title(f'{demo_name} - X Velocity')
+    ax1.grid(True)
+    
+    ax2.plot(t_vel, vy_smooth, 'g-', linewidth=1.5)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Velocity (m/s)')
+    ax2.set_title(f'{demo_name} - Y Velocity')
+    ax2.grid(True)
+    
+    ax3.plot(t_vel, vz_smooth, 'b-', linewidth=1.5)
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Velocity (m/s)')
+    ax3.set_title(f'{demo_name} - Z Velocity')
+    ax3.grid(True)
+    
+    plt.tight_layout()
+    
+    output_path = os.path.join(output_folder, f'{demo_name}_velocity.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f'Saved: {output_path}')
+    plt.close()
 
-ax1.set_xlabel('Time (samples)')
-ax1.set_ylabel('X')
-ax1.set_title('X Position vs Time')
-ax1.legend()
+# Create combined plot with all demos overlapped
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
+
+for data in all_velocities:
+    ax1.plot(data['t'], data['vx'], linewidth=1.2, alpha=0.7, label=data['name'])
+    ax2.plot(data['t'], data['vy'], linewidth=1.2, alpha=0.7, label=data['name'])
+    ax3.plot(data['t'], data['vz'], linewidth=1.2, alpha=0.7, label=data['name'])
+
+ax1.set_xlabel('Time (s)')
+ax1.set_ylabel('Velocity (m/s)')
+ax1.set_title('All Demos - X Velocity')
+ax1.legend(fontsize=7, loc='upper right')
 ax1.grid(True)
 
-ax2.set_xlabel('Time (samples)')
-ax2.set_ylabel('Y')
-ax2.set_title('Y Position vs Time')
-ax2.legend()
+ax2.set_xlabel('Time (s)')
+ax2.set_ylabel('Velocity (m/s)')
+ax2.set_title('All Demos - Y Velocity')
+ax2.legend(fontsize=7, loc='upper right')
 ax2.grid(True)
 
-ax3.set_xlabel('Time (samples)')
-ax3.set_ylabel('Z')
-ax3.set_title('Z Position vs Time')
-ax3.legend()
+ax3.set_xlabel('Time (s)')
+ax3.set_ylabel('Velocity (m/s)')
+ax3.set_title('All Demos - Z Velocity')
+ax3.legend(fontsize=7, loc='upper right')
 ax3.grid(True)
 
-ax4.set_xlabel('Time (samples)')
-ax4.set_ylabel('Quaternion Value')
-ax4.set_title('Quaternion Components vs Time')
-ax4.legend(fontsize=6, ncol=2)
-ax4.grid(True)
-
 plt.tight_layout()
-plt.show()
+combined_path = os.path.join(output_folder, 'all_demos_velocity.png')
+plt.savefig(combined_path, dpi=150, bbox_inches='tight')
+print(f'Saved: {combined_path}')
+plt.close()
+
+print(f'\nAll velocity plots saved to: {output_folder}/')
