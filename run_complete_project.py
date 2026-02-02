@@ -282,26 +282,18 @@ def run_section_a(demos, output_dir):
     # Summary statistics
     axes[1, 1].axis('off')
     summary_text = f"""
-    DEMONSTRATION SUMMARY
-    {'='*40}
-    
     Total demonstrations: {len(demos)}
     
-    {demo_name} Analysis:
-    - Duration: {times[-1]:.2f} seconds
-    - Points: {len(positions)}
-    - X range: [{positions[:,0].min():.3f}, {positions[:,0].max():.3f}] m
-    - Y range: [{positions[:,1].min():.3f}, {positions[:,1].max():.3f}] m  
-    - Z range: [{positions[:,2].min():.3f}, {positions[:,2].max():.3f}] m
-    - Identified POI (pick/place): {len(z_minima)}
-    
-    Points of Interest (POI):
-    - Detected by Z-minima + low velocity
-    - Red markers show pick/place locations
+    {demo_name} Statistics:
+    Duration: {times[-1]:.2f}s
+    Points: {len(positions)}
+    X: [{positions[:,0].min():.3f}, {positions[:,0].max():.3f}] m
+    Y: [{positions[:,1].min():.3f}, {positions[:,1].max():.3f}] m  
+    Z: [{positions[:,2].min():.3f}, {positions[:,2].max():.3f}] m
+    POI detected: {len(z_minima)}
     """
     axes[1, 1].text(0.1, 0.9, summary_text, transform=axes[1, 1].transAxes,
-                   fontsize=10, verticalalignment='top', fontfamily='monospace',
-                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                   fontsize=10, verticalalignment='top', fontfamily='monospace')
     
     plt.tight_layout()
     plt.savefig(os.path.join(section_dir, 'poi_analysis.png'), dpi=150, bbox_inches='tight')
@@ -837,116 +829,290 @@ def run_section_d(demos, output_dir):
     
     print(f"  Aligned {len(aligned_demos)} demos to {n_resample} points each")
     
-    # Stack all data for GMM training
-    all_data = []
+    # Stack all data for GMM training (COMPLETE TRAJECTORIES)
+    all_data_complete = []
     for name, (times, positions) in aligned_demos.items():
         demo_data = np.hstack([times.reshape(-1, 1), positions])
-        all_data.append(demo_data)
+        all_data_complete.append(demo_data)
     
-    all_data = np.vstack(all_data)
-    print(f"  Total training data: {all_data.shape[0]} samples, {all_data.shape[1]} dimensions")
+    all_data_complete = np.vstack(all_data_complete)
+    print(f"  Total training data (complete): {all_data_complete.shape[0]} samples, {all_data_complete.shape[1]} dimensions")
     
-    # Find optimal number of Gaussians
-    print("\n2. Finding optimal number of Gaussians (BIC)...")
-    bic_scores = {}
+    all_data_complete = np.vstack(all_data_complete)
+    print(f"  Total training data (complete): {all_data_complete.shape[0]} samples, {all_data_complete.shape[1]} dimensions")
+    
+    # Prepare PIECEWISE data by segmenting trajectories
+    print("\n  Segmenting trajectories for piecewise learning...")
+    all_segments = []
+    
+    for name, (demo_times, demo_trajectory) in demos.items():
+        if name in EXCLUDED_DEMOS:
+            continue
+        
+        # Use the same segmentation as Section B
+        segments = identify_pick_place_segments(demo_trajectory, demo_times)
+        for i, seg in enumerate(segments):
+            seg['demo_name'] = name
+            seg['segment_id'] = f"{name}_seg{i+1}"
+            all_segments.append(seg)
+    
+    print(f"  Found {len(all_segments)} segments for piecewise learning")
+    
+    # Prepare piecewise data by resampling segments
+    all_data_piecewise = []
+    n_segment_resample = 100  # Fewer points per segment
+    
+    for segment in all_segments:
+        seg_times = segment['times']
+        seg_traj = segment['trajectory'][:, :3]
+        
+        # Resample segment
+        t_uniform, pos_resampled = resample_trajectory(seg_times, seg_traj, n_segment_resample)
+        segment_data = np.hstack([t_uniform.reshape(-1, 1), pos_resampled])
+        all_data_piecewise.append(segment_data)
+    
+    if len(all_data_piecewise) > 0:
+        all_data_piecewise = np.vstack(all_data_piecewise)
+        print(f"  Total training data (piecewise): {all_data_piecewise.shape[0]} samples, {all_data_piecewise.shape[1]} dimensions")
+    else:
+        print("  WARNING: No segments found for piecewise learning!")
+        all_data_piecewise = all_data_complete  # Fallback
+    
+    # Find optimal number of Gaussians FOR COMPLETE TRAJECTORIES
+    print("\n2. Finding optimal number of Gaussians (BIC) - COMPLETE TRAJECTORIES...")
+    bic_scores_complete = {}
     
     for n in range(2, 16):
         try:
-            gmm = fit_gmm(all_data, n)
-            bic = gmm.bic(all_data)
-            bic_scores[n] = bic
+            gmm = fit_gmm(all_data_complete, n)
+            bic = gmm.bic(all_data_complete)
+            bic_scores_complete[n] = bic
             print(f"    n={n}: BIC={bic:.2f}")
         except Exception as e:
             print(f"    n={n}: Failed")
     
-    optimal_n = min(bic_scores, key=bic_scores.get)
-    print(f"\n  Optimal number of Gaussians: {optimal_n}")
+    optimal_n_complete = min(bic_scores_complete, key=bic_scores_complete.get)
+    print(f"\n  Optimal number of Gaussians (complete): {optimal_n_complete}")
     
-    # Train final GMM
-    print("\n3. Training GMM with optimal components...")
-    gmm = fit_gmm(all_data, optimal_n)
-    print(f"  GMM converged: {gmm.converged_}")
+    # Find optimal number of Gaussians FOR PIECEWISE
+    print("\n  Finding optimal number of Gaussians (BIC) - PIECEWISE TRAJECTORIES...")
+    bic_scores_piecewise = {}
     
-    # GMR prediction
-    print("\n4. Generating trajectory using GMR...")
+    for n in range(2, 16):
+        try:
+            gmm = fit_gmm(all_data_piecewise, n)
+            bic = gmm.bic(all_data_piecewise)
+            bic_scores_piecewise[n] = bic
+            print(f"    n={n}: BIC={bic:.2f}")
+        except Exception as e:
+            print(f"    n={n}: Failed")
+    
+    optimal_n_piecewise = min(bic_scores_piecewise, key=bic_scores_piecewise.get)
+    print(f"\n  Optimal number of Gaussians (piecewise): {optimal_n_piecewise}")
+    
+    # Train final GMM - COMPLETE
+    print("\n3. Training GMM with optimal components - COMPLETE TRAJECTORIES...")
+    gmm_complete = fit_gmm(all_data_complete, optimal_n_complete)
+    print(f"  GMM converged: {gmm_complete.converged_}")
+    
+    # Train final GMM - PIECEWISE
+    print("\n  Training GMM with optimal components - PIECEWISE TRAJECTORIES...")
+    gmm_piecewise = fit_gmm(all_data_piecewise, optimal_n_piecewise)
+    print(f"  GMM converged: {gmm_piecewise.converged_}")
+    
+    # GMR prediction - COMPLETE
+    print("\n4. Generating trajectory using GMR - COMPLETE...")
     t_query = np.linspace(0, 1, n_resample).reshape(-1, 1)
-    gmr_trajectory = gmr_predict(gmm, t_query, input_dims=[0], output_dims=[1, 2, 3])
+    gmr_trajectory_complete = gmr_predict(gmm_complete, t_query, input_dims=[0], output_dims=[1, 2, 3])
     
-    # Compute error
-    total_error = 0
+    # GMR prediction - PIECEWISE (reconstruct full trajectory from segments)
+    print("\n  Generating trajectory using GMR - PIECEWISE...")
+    # For piecewise, we need to reconstruct each segment type
+    # For simplicity, we'll generate segments and concatenate them
+    # Assuming we have consistent segment structure
+    
+    if len(all_segments) > 0:
+        # Use the piecewise GMM to generate a representative trajectory
+        t_query_piece = np.linspace(0, 1, n_segment_resample).reshape(-1, 1)
+        gmr_trajectory_piecewise = gmr_predict(gmm_piecewise, t_query_piece, input_dims=[0], output_dims=[1, 2, 3])
+        
+        # Scale it to full trajectory length for comparison
+        t_piece_full = np.linspace(0, 1, len(gmr_trajectory_piecewise))
+        gmr_trajectory_piecewise_full = np.zeros((n_resample, 3))
+        for dim in range(3):
+            interp_func = interp1d(t_piece_full, gmr_trajectory_piecewise[:, dim], 
+                                  kind='linear', fill_value='extrapolate')
+            gmr_trajectory_piecewise_full[:, dim] = interp_func(np.linspace(0, 1, n_resample))
+    else:
+        gmr_trajectory_piecewise_full = gmr_trajectory_complete.copy()
+    
+    # Compute errors - COMPLETE
+    total_error_complete = 0
     for name, (times, positions) in aligned_demos.items():
-        error = np.mean(np.linalg.norm(gmr_trajectory - positions, axis=1))
-        total_error += error
-    avg_error = total_error / len(aligned_demos) * 1000
-    print(f"\n  Average reproduction error: {avg_error:.2f}mm")
+        error = np.mean(np.linalg.norm(gmr_trajectory_complete - positions, axis=1))
+        total_error_complete += error
+    avg_error_complete = total_error_complete / len(aligned_demos) * 1000
+    print(f"\n  Average reproduction error (COMPLETE): {avg_error_complete:.2f}mm")
+    
+    # Compute errors - PIECEWISE
+    total_error_piecewise = 0
+    for name, (times, positions) in aligned_demos.items():
+        error = np.mean(np.linalg.norm(gmr_trajectory_piecewise_full - positions, axis=1))
+        total_error_piecewise += error
+    avg_error_piecewise = total_error_piecewise / len(aligned_demos) * 1000
+    print(f"  Average reproduction error (PIECEWISE): {avg_error_piecewise:.2f}mm")
+    
+    improvement = avg_error_piecewise - avg_error_complete
+    better_approach = "COMPLETE" if avg_error_complete < avg_error_piecewise else "PIECEWISE"
+    print(f"\n  BETTER APPROACH: {better_approach}")
+    print(f"  Difference: {abs(improvement):.2f}mm")
     
     # Visualization
     print("\n5. Creating visualizations...")
     
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(20, 14))
     
-    # BIC plot
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax1.plot(list(bic_scores.keys()), list(bic_scores.values()), 'b-o', linewidth=2)
-    ax1.axvline(optimal_n, color='r', linestyle='--', label=f'Optimal: {optimal_n}')
+    fig = plt.figure(figsize=(20, 14))
+    
+    # BIC plot - COMPLETE vs PIECEWISE
+    ax1 = fig.add_subplot(3, 3, 1)
+    ax1.plot(list(bic_scores_complete.keys()), list(bic_scores_complete.values()), 
+            'b-o', linewidth=2, label='Complete')
+    ax1.plot(list(bic_scores_piecewise.keys()), list(bic_scores_piecewise.values()), 
+            'r-s', linewidth=2, label='Piecewise')
+    ax1.axvline(optimal_n_complete, color='b', linestyle='--', alpha=0.5)
+    ax1.axvline(optimal_n_piecewise, color='r', linestyle='--', alpha=0.5)
     ax1.set_xlabel('Number of Gaussians')
     ax1.set_ylabel('BIC Score')
-    ax1.set_title('BIC Score vs Number of Gaussians')
+    ax1.set_title(f'BIC: Complete (opt={optimal_n_complete}) vs Piecewise (opt={optimal_n_piecewise})')
     ax1.legend()
     ax1.grid(True)
     
-    # 3D comparison
-    ax2 = fig.add_subplot(2, 3, 2, projection='3d')
+    # 3D comparison - COMPLETE
+    ax2 = fig.add_subplot(3, 3, 2, projection='3d')
     for name, (times, positions) in aligned_demos.items():
-        ax2.plot(positions[:, 0], positions[:, 1], positions[:, 2], alpha=0.4, linewidth=1)
-    ax2.plot(gmr_trajectory[:, 0], gmr_trajectory[:, 1], gmr_trajectory[:, 2], 
-            'k-', linewidth=3, label='GMR Output')
+        ax2.plot(positions[:, 0], positions[:, 1], positions[:, 2], alpha=0.3, linewidth=1)
+    ax2.plot(gmr_trajectory_complete[:, 0], gmr_trajectory_complete[:, 1], gmr_trajectory_complete[:, 2], 
+            'b-', linewidth=3, label='GMR Complete')
     ax2.set_xlabel('X (m)')
     ax2.set_ylabel('Y (m)')
     ax2.set_zlabel('Z (m)')
-    ax2.set_title('Demonstrations vs GMR Reproduction')
+    ax2.set_title(f'Complete Trajectory GMR\nError: {avg_error_complete:.2f}mm')
     ax2.legend()
     
-    # Position profiles
-    t_gmr = np.linspace(0, 1, len(gmr_trajectory))
-    
-    ax3 = fig.add_subplot(2, 3, 3)
+    # 3D comparison - PIECEWISE
+    ax3 = fig.add_subplot(3, 3, 3, projection='3d')
     for name, (times, positions) in aligned_demos.items():
-        ax3.plot(times, positions[:, 0], alpha=0.4, linewidth=1)
-    ax3.plot(t_gmr, gmr_trajectory[:, 0], 'k-', linewidth=2, label='GMR')
-    ax3.set_xlabel('Normalized Time')
-    ax3.set_ylabel('X Position (m)')
-    ax3.set_title('X Position: Demos vs GMR')
-    ax3.grid(True)
+        ax3.plot(positions[:, 0], positions[:, 1], positions[:, 2], alpha=0.3, linewidth=1)
+    ax3.plot(gmr_trajectory_piecewise_full[:, 0], gmr_trajectory_piecewise_full[:, 1], 
+            gmr_trajectory_piecewise_full[:, 2], 'r-', linewidth=3, label='GMR Piecewise')
+    ax3.set_xlabel('X (m)')
+    ax3.set_ylabel('Y (m)')
+    ax3.set_zlabel('Z (m)')
+    ax3.set_title(f'Piecewise Trajectory GMR\nError: {avg_error_piecewise:.2f}mm')
+    ax3.legend()
     
-    ax4 = fig.add_subplot(2, 3, 4)
+    # Position profiles - X axis
+    t_gmr = np.linspace(0, 1, len(gmr_trajectory_complete))
+    
+    ax4 = fig.add_subplot(3, 3, 4)
     for name, (times, positions) in aligned_demos.items():
-        ax4.plot(times, positions[:, 1], alpha=0.4, linewidth=1)
-    ax4.plot(t_gmr, gmr_trajectory[:, 1], 'k-', linewidth=2, label='GMR')
+        ax4.plot(times, positions[:, 0], alpha=0.3, linewidth=1, color='gray')
+    ax4.plot(t_gmr, gmr_trajectory_complete[:, 0], 'b-', linewidth=2, label='GMR Complete')
+    ax4.plot(t_gmr, gmr_trajectory_piecewise_full[:, 0], 'r--', linewidth=2, label='GMR Piecewise')
     ax4.set_xlabel('Normalized Time')
-    ax4.set_ylabel('Y Position (m)')
-    ax4.set_title('Y Position: Demos vs GMR')
+    ax4.set_ylabel('X Position (m)')
+    ax4.set_title('X Position: Complete vs Piecewise')
+    ax4.legend()
     ax4.grid(True)
     
-    ax5 = fig.add_subplot(2, 3, 5)
+    ax5 = fig.add_subplot(3, 3, 5)
     for name, (times, positions) in aligned_demos.items():
-        ax5.plot(times, positions[:, 2], alpha=0.4, linewidth=1)
-    ax5.plot(t_gmr, gmr_trajectory[:, 2], 'k-', linewidth=2, label='GMR')
+        ax5.plot(times, positions[:, 1], alpha=0.3, linewidth=1, color='gray')
+    ax5.plot(t_gmr, gmr_trajectory_complete[:, 1], 'b-', linewidth=2, label='GMR Complete')
+    ax5.plot(t_gmr, gmr_trajectory_piecewise_full[:, 1], 'r--', linewidth=2, label='GMR Piecewise')
     ax5.set_xlabel('Normalized Time')
-    ax5.set_ylabel('Z Position (m)')
-    ax5.set_title('Z Position: Demos vs GMR')
+    ax5.set_ylabel('Y Position (m)')
+    ax5.set_title('Y Position: Complete vs Piecewise')
+    ax5.legend()
     ax5.grid(True)
     
-    # GMM components visualization
-    ax6 = fig.add_subplot(2, 3, 6)
+    ax6 = fig.add_subplot(3, 3, 6)
+    for name, (times, positions) in aligned_demos.items():
+        ax6.plot(times, positions[:, 2], alpha=0.3, linewidth=1, color='gray')
+    ax6.plot(t_gmr, gmr_trajectory_complete[:, 2], 'b-', linewidth=2, label='GMR Complete')
+    ax6.plot(t_gmr, gmr_trajectory_piecewise_full[:, 2], 'r--', linewidth=2, label='GMR Piecewise')
+    ax6.set_xlabel('Normalized Time')
+    ax6.set_ylabel('Z Position (m)')
+    ax6.set_title('Z Position: Complete vs Piecewise')
+    ax6.legend()
+    ax6.grid(True)
+    
+    # Error comparison bar plot
+    ax7 = fig.add_subplot(3, 3, 7)
+    approaches = ['Complete\nTrajectory', 'Piecewise\nTrajectory']
+    errors = [avg_error_complete, avg_error_piecewise]
+    colors_bar = ['blue' if avg_error_complete < avg_error_piecewise else 'lightblue',
+                  'red' if avg_error_piecewise < avg_error_complete else 'lightcoral']
+    bars = ax7.bar(approaches, errors, color=colors_bar, edgecolor='black', linewidth=2)
+    ax7.set_ylabel('Average Error (mm)')
+    ax7.set_title('Reconstruction Error Comparison')
+    ax7.grid(True, axis='y', alpha=0.3)
+    
+    # Add value labels on bars
+    for bar, err in zip(bars, errors):
+        height = bar.get_height()
+        ax7.text(bar.get_x() + bar.get_width()/2., height,
+                f'{err:.2f}mm', ha='center', va='bottom', fontweight='bold', fontsize=11)
+    
+    # GMM components visualization - COMPLETE
+    ax8 = fig.add_subplot(3, 3, 8)
     from matplotlib.patches import Ellipse
     
     for name, (times, positions) in aligned_demos.items():
-        ax6.scatter(times, positions[:, 0], alpha=0.2, s=5)
+        ax8.scatter(times, positions[:, 0], alpha=0.2, s=3, color='gray')
     
-    for k in range(min(gmm.n_components, 15)):
-        mean = gmm.means_[k]
-        cov = gmm.covariances_[k]
+    for k in range(min(gmm_complete.n_components, 15)):
+        mean = gmm_complete.means_[k]
+        cov = gmm_complete.covariances_[k]
+        
+        t_mean, x_mean = mean[0], mean[1]
+        cov_2d = cov[np.ix_([0, 1], [0, 1])]
+        
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_2d)
+            order = eigenvalues.argsort()[::-1]
+            eigenvalues = eigenvalues[order]
+            eigenvectors = eigenvectors[:, order]
+            
+            angle = np.degrees(np.arctan2(*eigenvectors[:, 0][::-1]))
+            width, height = 4 * np.sqrt(np.abs(eigenvalues))
+            
+            ellipse = Ellipse(xy=(t_mean, x_mean), width=width, height=height,
+                            angle=angle, alpha=0.3, color='blue')
+            ax8.add_patch(ellipse)
+            ax8.scatter(t_mean, x_mean, c='blue', s=30, marker='x')
+        except:
+            pass
+    
+    ax8.set_xlabel('Normalized Time')
+    ax8.set_ylabel('X Position (m)')
+    ax8.set_title(f'GMM Components - Complete (n={optimal_n_complete})')
+    ax8.set_xlim(-0.1, 1.1)
+    
+    # GMM components visualization - PIECEWISE
+    ax9 = fig.add_subplot(3, 3, 9)
+    
+    # Plot piecewise segment data
+    for segment in all_segments[:20]:  # Limit to avoid clutter
+        seg_times = segment['times']
+        seg_traj = segment['trajectory'][:, :3]
+        t_norm = seg_times / seg_times[-1] if seg_times[-1] > 0 else seg_times
+        ax9.scatter(t_norm, seg_traj[:, 0], alpha=0.2, s=3, color='gray')
+    
+    for k in range(min(gmm_piecewise.n_components, 15)):
+        mean = gmm_piecewise.means_[k]
+        cov = gmm_piecewise.covariances_[k]
         
         t_mean, x_mean = mean[0], mean[1]
         cov_2d = cov[np.ix_([0, 1], [0, 1])]
@@ -962,32 +1128,143 @@ def run_section_d(demos, output_dir):
             
             ellipse = Ellipse(xy=(t_mean, x_mean), width=width, height=height,
                             angle=angle, alpha=0.3, color='red')
-            ax6.add_patch(ellipse)
-            ax6.scatter(t_mean, x_mean, c='red', s=30, marker='x')
+            ax9.add_patch(ellipse)
+            ax9.scatter(t_mean, x_mean, c='red', s=30, marker='x')
         except:
             pass
     
-    ax6.set_xlabel('Normalized Time')
-    ax6.set_ylabel('X Position (m)')
-    ax6.set_title(f'GMM Components (n={optimal_n})')
-    ax6.set_xlim(-0.1, 1.1)
+    ax9.set_xlabel('Normalized Time')
+    ax9.set_ylabel('X Position (m)')
+    ax9.set_title(f'GMM Components - Piecewise (n={optimal_n_piecewise})')
+    ax9.set_xlim(-0.1, 1.1)
+    
+    plt.suptitle('GMM/GMR Comparison: Complete vs Piecewise Trajectories', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(section_dir, 'gmm_gmr_comparison.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {section_dir}/gmm_gmr_comparison.png")
+    
+    # Create detailed analysis plot
+    fig2, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Overlay complete vs piecewise in 3D
+    ax_3d = fig2.add_subplot(2, 2, 1, projection='3d')
+    ax_3d.plot(gmr_trajectory_complete[:, 0], gmr_trajectory_complete[:, 1], 
+              gmr_trajectory_complete[:, 2], 'b-', linewidth=3, label='Complete', alpha=0.7)
+    ax_3d.plot(gmr_trajectory_piecewise_full[:, 0], gmr_trajectory_piecewise_full[:, 1], 
+              gmr_trajectory_piecewise_full[:, 2], 'r--', linewidth=3, label='Piecewise', alpha=0.7)
+    # Show original demos faintly
+    for name, (times, positions) in list(aligned_demos.items())[:3]:
+        ax_3d.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                  'gray', linewidth=0.5, alpha=0.3)
+    ax_3d.set_xlabel('X (m)')
+    ax_3d.set_ylabel('Y (m)')
+    ax_3d.set_zlabel('Z (m)')
+    ax_3d.set_title('Direct Comparison: Complete (blue) vs Piecewise (red)')
+    ax_3d.legend(fontsize=10)
+    
+    # Error per demonstration
+    ax_err = axes[0, 1]
+    demo_names_list = list(aligned_demos.keys())
+    errors_complete_per_demo = []
+    errors_piecewise_per_demo = []
+    
+    for name, (times, positions) in aligned_demos.items():
+        err_c = np.mean(np.linalg.norm(gmr_trajectory_complete - positions, axis=1)) * 1000
+        err_p = np.mean(np.linalg.norm(gmr_trajectory_piecewise_full - positions, axis=1)) * 1000
+        errors_complete_per_demo.append(err_c)
+        errors_piecewise_per_demo.append(err_p)
+    
+    x_pos = np.arange(len(demo_names_list))
+    width = 0.35
+    ax_err.bar(x_pos - width/2, errors_complete_per_demo, width, label='Complete', color='blue', alpha=0.7)
+    ax_err.bar(x_pos + width/2, errors_piecewise_per_demo, width, label='Piecewise', color='red', alpha=0.7)
+    ax_err.set_xlabel('Demonstration')
+    ax_err.set_ylabel('Error (mm)')
+    ax_err.set_title('Error Per Demonstration')
+    ax_err.set_xticks(x_pos)
+    ax_err.set_xticklabels(demo_names_list, rotation=45, ha='right', fontsize=8)
+    ax_err.legend()
+    ax_err.grid(True, axis='y', alpha=0.3)
+    
+    # Summary statistics
+    axes[1, 0].axis('off')
+    
+    # Determine which is better
+    if avg_error_complete < avg_error_piecewise:
+        winner = "COMPLETE"
+    else:
+        winner = "PIECEWISE"
+    
+    summary_text = f"""
+    COMPLETE vs PIECEWISE COMPARISON
+    
+    Complete Trajectory:
+    Gaussians: {optimal_n_complete}
+    Error: {avg_error_complete:.2f}mm
+    Samples: {all_data_complete.shape[0]}
+    BIC: {bic_scores_complete[optimal_n_complete]:.2f}
+    
+    Piecewise Trajectory:
+    Gaussians: {optimal_n_piecewise}
+    Error: {avg_error_piecewise:.2f}mm
+    Samples: {all_data_piecewise.shape[0]}
+    Segments: {len(all_segments)}
+    BIC: {bic_scores_piecewise[optimal_n_piecewise]:.2f}
+    
+    Better approach: {winner}
+    Difference: {abs(improvement):.2f}mm
+    """
+    
+    axes[1, 0].text(0.05, 0.95, summary_text, transform=axes[1, 0].transAxes,
+                   fontsize=9, verticalalignment='top', fontfamily='monospace')
+    
+    # Distance between complete and piecewise trajectories
+    ax_dist = axes[1, 1]
+    point_distances = np.linalg.norm(gmr_trajectory_complete - gmr_trajectory_piecewise_full, axis=1) * 1000
+    ax_dist.plot(t_gmr, point_distances, 'purple', linewidth=2)
+    ax_dist.fill_between(t_gmr, 0, point_distances, alpha=0.3, color='purple')
+    ax_dist.set_xlabel('Normalized Time')
+    ax_dist.set_ylabel('Distance (mm)')
+    ax_dist.set_title('Point-wise Distance: Complete vs Piecewise')
+    ax_dist.grid(True, alpha=0.3)
+    ax_dist.axhline(y=np.mean(point_distances), color='red', linestyle='--', 
+                   label=f'Mean: {np.mean(point_distances):.2f}mm')
+    ax_dist.legend()
     
     plt.tight_layout()
-    plt.savefig(os.path.join(section_dir, 'gmm_gmr_results.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(section_dir, 'piecewise_vs_complete_analysis.png'), 
+               dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  Saved: {section_dir}/gmm_gmr_results.png")
+    print(f"  Saved: {section_dir}/piecewise_vs_complete_analysis.png")
     
     # Save results
     np.savez(os.path.join(section_dir, 'gmm_gmr_results.npz'),
-            gmr_trajectory=gmr_trajectory,
-            optimal_n=optimal_n,
-            bic_scores=bic_scores,
-            gmm_means=gmm.means_,
-            gmm_weights=gmm.weights_)
+            gmr_trajectory_complete=gmr_trajectory_complete,
+            gmr_trajectory_piecewise=gmr_trajectory_piecewise_full,
+            optimal_n_complete=optimal_n_complete,
+            optimal_n_piecewise=optimal_n_piecewise,
+            bic_scores_complete=bic_scores_complete,
+            bic_scores_piecewise=bic_scores_piecewise,
+            avg_error_complete=avg_error_complete,
+            avg_error_piecewise=avg_error_piecewise,
+            gmm_means_complete=gmm_complete.means_,
+            gmm_weights_complete=gmm_complete.weights_,
+            gmm_means_piecewise=gmm_piecewise.means_,
+            gmm_weights_piecewise=gmm_piecewise.weights_,
+            better_approach=winner)
     print(f"  Saved: {section_dir}/gmm_gmr_results.npz")
     
-    print("\n  Section D Complete!")
-    return {'optimal_gaussians': optimal_n, 'avg_error_mm': avg_error}
+    print(f"\n  Section D Complete!")
+    print(f"  WINNER: {winner} ({abs(improvement):.2f}mm better)")
+    return {
+        'optimal_gaussians_complete': optimal_n_complete,
+        'optimal_gaussians_piecewise': optimal_n_piecewise,
+        'avg_error_complete_mm': avg_error_complete,
+        'avg_error_piecewise_mm': avg_error_piecewise,
+        'better_approach': winner,
+        'improvement_mm': abs(improvement)
+    }
 
 
 # ============================================================================
@@ -1174,28 +1451,20 @@ def run_section_e(demos, output_dir):
     ax4.axis('off')
     
     summary = f"""
-    OBSTACLE AVOIDANCE SUMMARY
-    {'='*40}
+    Obstacle Avoidance Results
     
-    Number of obstacles: {len(obstacles)}
-    Avoidance gamma: 500
+    Obstacles: {len(obstacles)}
+    Gamma: 500
     Influence radius: 0.12m
     
-    RESULTS:
-    - Min clearance (no avoidance): {min_dist_no*1000:.2f}mm
-    - Min clearance (with avoidance): {min_dist_with*1000:.2f}mm
-    - Improvement: {(min_dist_with - min_dist_no)*1000:.2f}mm
+    Min clearance (without): {min_dist_no*1000:.2f}mm
+    Min clearance (with): {min_dist_with*1000:.2f}mm
+    Improvement: {(min_dist_with - min_dist_no)*1000:.2f}mm
     
-    Goal accuracy (with avoidance):
-    - Final position error: {np.linalg.norm(traj_with_obs[-1] - goal)*1000:.2f}mm
-    
-    The potential field method successfully pushes
-    the trajectory away from obstacles while
-    maintaining smooth motion towards the goal.
+    Final position error: {np.linalg.norm(traj_with_obs[-1] - goal)*1000:.2f}mm
     """
     ax4.text(0.1, 0.9, summary, transform=ax4.transAxes, fontsize=10,
-            verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            verticalalignment='top', fontfamily='monospace')
     
     plt.tight_layout()
     plt.savefig(os.path.join(section_dir, 'obstacle_avoidance.png'), dpi=150, bbox_inches='tight')
@@ -1283,11 +1552,11 @@ def main():
     print_section("PROJECT SUMMARY")
     
     print(f"""
-    Section A (Data Plotting & POI):     {'✓ Complete' if 'error' not in results.get('section_a', {}) else '✗ Failed'}
-    Section B (DMP):                     {'✓ Complete' if 'error' not in results.get('section_b', {}) else '✗ Failed'}
-    Section C (DTW Alignment):           {'✓ Complete' if 'error' not in results.get('section_c', {}) else '✗ Failed'}
-    Section D (GMM/GMR):                 {'✓ Complete' if 'error' not in results.get('section_d', {}) else '✗ Failed'}
-    Section E (Obstacle Avoidance):      {'✓ Complete' if 'error' not in results.get('section_e', {}) else '✗ Failed'}
+    Section A (Data Plotting & POI):     {'Complete' if 'error' not in results.get('section_a', {}) else 'Failed'}
+    Section B (DMP):                     {'Complete' if 'error' not in results.get('section_b', {}) else 'Failed'}
+    Section C (DTW Alignment):           {'Complete' if 'error' not in results.get('section_c', {}) else 'Failed'}
+    Section D (GMM/GMR):                 {'Complete' if 'error' not in results.get('section_d', {}) else 'Failed'}
+    Section E (Obstacle Avoidance):      {'Complete' if 'error' not in results.get('section_e', {}) else 'Failed'}
     
     Output saved to: {OUTPUT_DIR}/
     """)
